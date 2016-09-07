@@ -17,12 +17,13 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <signal.h>
-
+#include <time.h>
 #include <gflags/gflags.h>
 #include <tprinter.h>
 #include <string_util.h>
 #include "rapidjson/document.h"
 #include "rapidjson/filereadstream.h"
+#include "rapidjson/error/en.h"
 #include "master/master_watcher.h"
 #include "ins_sdk.h"
 
@@ -34,7 +35,7 @@ DEFINE_string(n, "", "specify job name to query pods");
 DEFINE_string(j, "", "specify job id");
 DEFINE_string(l, "", "add a label to agent");
 DEFINE_string(p, "", "specify pod id");
-DEFINE_string(a, "", "specify agent addr");
+DEFINE_string(e, "", "specify agent endpoint");
 DEFINE_int32(d, 0, "specify delay time to query");
 DEFINE_int32(cli_server_port, 8775, "cli server listen port");
 DECLARE_string(flagfile);
@@ -45,12 +46,15 @@ const std::string kGalaxyUsage = "galaxy client.\n"
                                  "    galaxy jobs \n"
                                  "    galaxy agents\n"
                                  "    galaxy pods -j <jobid>\n"
+                                 "    galaxy pods -e <endpoint>\n"
+                                 "    galaxy tasks -j <jobid>\n"
+                                 "    galaxy tasks -e <endpoint>\n"
                                  "    galaxy kill -j <jobid>\n"
                                  "    galaxy update -j <jobid> -f <jobconfig>\n"
                                  "    galaxy label -l <label> -f <lableconfig>\n"
                                  "    galaxy preempt -f <config>\n"
-                                 "    galaxy offline -a <agent_addr>\n"
-                                 "    galaxy online -a <agent_addr>\n"
+                                 "    galaxy offline -e <endpoint>\n"
+                                 "    galaxy online -e <endpoint>\n"
                                  "    galaxy status \n"
                                  "    galaxy enter safemode \n"
                                  "    galaxy leave safemode \n"
@@ -59,8 +63,20 @@ const std::string kGalaxyUsage = "galaxy client.\n"
                                  "    -j jobid     Specify job id to kill or update.\n"
                                  "    -d delay     Specify delay in second to update infomation.\n"
                                  "    -l label     Add label to list of agents.\n"
-                                 "    -a agent     Specify agent addr.\n"
+                                 "    -e agent     Specify endpoint.\n"
                                  "    -n name      Specify job name to query pods.\n";
+std::string FormatDate(int64_t datetime) {
+    if (datetime < 100) {
+        return "-";
+    }
+    char buffer[100];
+    time_t time = datetime / 1000000;
+    struct tm *tmp;
+    tmp = localtime(&time);
+    strftime(buffer, 100, "%F %X", tmp);
+    std::string ret(buffer);
+    return ret;
+}
 
 int ReadableStringToInt(const std::string& input, int64_t* output) {
     if (output == NULL) {
@@ -169,6 +185,7 @@ int BuildPreemptFromConfig(const std::string& config, ::baidu::galaxy::PreemptPr
     document.ParseStream<0>(frs);
     if (!document.IsObject()) {
         fprintf(stderr, "invalidate config file\n");
+        fprintf(stderr, "%s\n", rapidjson::GetParseError_En(document.GetParseError()));
         return -1;
     }
     if (!document.HasMember("addr")) {
@@ -222,11 +239,15 @@ int BuildJobFromConfig(const std::string& config, ::baidu::galaxy::JobDescriptio
     int ok = 0;
     FILE* fd = fopen(config.c_str(), "r");
     char buffer[5120];
+    int64_t cpu_total = 0;
+    int64_t memory_total = 0;
+
     rapidjson::FileReadStream frs(fd, buffer, sizeof(buffer));
     rapidjson::Document document;
     document.ParseStream<0>(frs);
     if (!document.IsObject()) {
-        fprintf(stderr, "invalidate config file\n");
+        fprintf(stderr, "parse job description %s", 
+                    config.c_str());
         return -1;
     }
     fclose(fd);
@@ -271,24 +292,32 @@ int BuildJobFromConfig(const std::string& config, ::baidu::galaxy::JobDescriptio
         fprintf(stderr, "millicores is required\n");
         return -1;
     }
-
+    if (pod_json.HasMember("namespace_isolation")) {
+        pod.namespace_isolation = pod_json["namespace_isolation"].GetBool();
+    } else {
+        pod.namespace_isolation = true;
+    }
     res->millicores = pod_require["millicores"].GetInt();
     if (!pod_require.HasMember("memory")) {
         fprintf(stderr, "memory is required\n");
         return -1;
     }
+    cpu_total = res->millicores;
+
     ok = ReadableStringToInt(pod_require["memory"].GetString(), &res->memory);
     if (ok != 0) {
         fprintf(stderr, "fail to parse pod memory %s\n", pod_require["memory"].GetString());
         return -1;
     }
+
+    memory_total = res->memory;
     if (pod_require.HasMember("ports")) {
         const rapidjson::Value&  pod_ports = pod_require["ports"];
         for (rapidjson::SizeType i = 0; i < pod_ports.Size(); i++) {
             res->ports.push_back(pod_ports[i].GetInt());
         }
     }
-    if (pod_json.HasMember("disks")) {
+    if (pod_require.HasMember("disks")) {
         const rapidjson::Value& pod_disks = pod_require["disks"];
         for (rapidjson::SizeType i = 0; i < pod_disks.Size(); i++) {
             ::baidu::galaxy::VolumeDescription vol;
@@ -297,7 +326,7 @@ int BuildJobFromConfig(const std::string& config, ::baidu::galaxy::JobDescriptio
             res->disks.push_back(vol);
         } 
     }
-    if (pod_json.HasMember("ssds")) {
+    if (pod_require.HasMember("ssds")) {
         const rapidjson::Value& pod_ssds = pod_require["ssds"];
         for (rapidjson::SizeType i = 0; i < pod_ssds.Size(); i++) {
             ::baidu::galaxy::VolumeDescription vol;
@@ -306,6 +335,65 @@ int BuildJobFromConfig(const std::string& config, ::baidu::galaxy::JobDescriptio
             res->ssds.push_back(vol);
         }
     }
+    if (pod_require.HasMember("read_bytes_ps")) {
+        ok = ReadableStringToInt(pod_require["read_bytes_ps"].GetString(), &res->read_bytes_ps);
+        if (ok != 0) {
+            fprintf(stderr, "fail to parse pod read_bytes_ps %s\n", pod_require["read_bytes_ps"].GetString());
+            return -1;
+        }
+    } else {
+        res->read_bytes_ps = 0;
+    }
+    if (pod_require.HasMember("write_bytes_ps")) {
+        ok = ReadableStringToInt(pod_require["write_bytes_ps"].GetString(), &res->write_bytes_ps);
+        if (ok != 0) {
+            fprintf(stderr, "fail to parse pod write_bytes_ps %s\n", pod_require["write_bytes_ps"].GetString());
+            return -1;
+        } 
+    } else {
+        res->write_bytes_ps = 0;
+    }
+    if (pod_require.HasMember("read_io_ps")) {
+        res->read_io_ps = pod_require["read_io_ps"].GetInt();
+    } else {
+        res->read_io_ps = 0;
+    }
+    if (pod_require.HasMember("write_io_ps")) {
+        res->write_io_ps = pod_require["write_io_ps"].GetInt();
+    } else {
+        res->write_io_ps = 0;
+    }
+
+    int64_t tmpfs_size = 0;
+    if (pod_require.HasMember("tmpfs")) {
+        const rapidjson::Value& tmpfs = pod_require["tmpfs"];
+
+        if (!tmpfs.HasMember("size")) {
+            fprintf(stderr, "size is required in tmpfs\n");
+            return -1;
+        }
+
+        if (0 !=  ReadableStringToInt(tmpfs["size"].GetString(), &tmpfs_size)) {
+            fprintf(stderr, "get tmpfs size failed");
+            return -1;
+        }
+
+        if (!tmpfs.HasMember("path")) {
+            fprintf(stderr, "path is required in tmpfs\n");
+        }
+
+        std::string tmpfs_path = tmpfs["path"].GetString();
+        if (tmpfs_path.empty()) {
+            fprintf(stderr, "not empty path is required in tmpfs\n");
+            return -1;
+        }
+
+        pod.tmpfs_path = tmpfs_path;
+        pod.tmpfs_size = tmpfs_size;
+    }
+
+    int64_t task_cpu_sum = 0;
+    int64_t task_memory_sum = 0;
     std::vector< ::baidu::galaxy::TaskDescription>& tasks = pod.tasks;
     if (pod_json.HasMember("tasks")) {
         const rapidjson::Value& tasks_json = pod_json["tasks"];
@@ -333,17 +421,24 @@ int BuildJobFromConfig(const std::string& config, ::baidu::galaxy::JobDescriptio
                     task.envs.insert(task_envs[i].GetString());
                 }
             }
+
             task.cpu_isolation_type= "kCpuIsolationHard";
             if (tasks_json[i].HasMember("cpu_isolation_type")) {
                 task.cpu_isolation_type = tasks_json[i]["cpu_isolation_type"].GetString();
             }
+            task.namespace_isolation = pod.namespace_isolation;
+
             res = &task.requirement;
             res->millicores = tasks_json[i]["requirement"]["millicores"].GetInt();
+            task_cpu_sum += res->millicores;
+
             ok = ReadableStringToInt(tasks_json[i]["requirement"]["memory"].GetString(), &res->memory);
             if (ok != 0) {
                 fprintf(stderr, "fail to parse task memory %s\n", tasks_json[i]["requirement"]["memory"].GetString());
                 return -1;
             }
+            task_memory_sum += res->memory;
+
             if (tasks_json[i]["requirement"].HasMember("ports")) {
                 const rapidjson::Value& task_ports = tasks_json[i]["requirement"]["ports"];
                 for (rapidjson::SizeType i = 0; i < task_ports.Size(); i++) {
@@ -359,7 +454,6 @@ int BuildJobFromConfig(const std::string& config, ::baidu::galaxy::JobDescriptio
                     res->disks.push_back(task_vol);
                 } 
             }
-
             if (tasks_json[i]["requirement"].HasMember("ssds")) {
                 const rapidjson::Value& task_ssds = tasks_json[i]["requirement"]["ssds"];
                 for (rapidjson::SizeType i = 0; i < task_ssds.Size(); i++){ 
@@ -369,11 +463,62 @@ int BuildJobFromConfig(const std::string& config, ::baidu::galaxy::JobDescriptio
                     res->ssds.push_back(task_vol);
                 }
             }
+            res->read_bytes_ps = 0;
+            if (tasks_json[i]["requirement"].HasMember("read_bytes_ps")) {
+                ok = ReadableStringToInt(tasks_json[i]["requirement"]["read_bytes_ps"].GetString(), &res->read_bytes_ps);
+                if (ok != 0) {
+                    fprintf(stderr, "fail to parse task read_bytes_ps %s\n", tasks_json[i]["requirement"]["read_bytes_ps"].GetString());
+                    return -1;
+                }
+            }
+            res->write_bytes_ps = 0;
+            if (tasks_json[i]["requirement"].HasMember("write_bytes_ps")) {
+                ok = ReadableStringToInt(tasks_json[i]["requirement"]["write_bytes_ps"].GetString(), &res->write_bytes_ps);
+                if (ok != 0) {
+                    fprintf(stderr, "fail to parse task write_bytes_ps %s\n", tasks_json[i]["requirement"]["write_bytes_ps"].GetString());
+                    return -1;
+                }
+            }
+            res->read_io_ps = 0;
+            if (tasks_json[i]["requirement"].HasMember("read_io_ps")) {
+                res->read_io_ps = tasks_json[i]["requirement"]["read_io_ps"].GetInt64();
+            }
+            res->write_io_ps = 0;
+            if (tasks_json[i]["requirement"].HasMember("write_io_ps")) {
+                res->write_io_ps = tasks_json[i]["requirement"]["write_io_ps"].GetInt64();
+            }
+            res->io_weight = 500;
+            if (tasks_json[i]["requirement"].HasMember("io_weight")) {
+                res->io_weight = tasks_json[i]["requirement"]["io_weight"].GetInt();
+                if (res->io_weight < 10 || res->io_weight > 1000) {
+                    fprintf(stderr, "invalid io_weight value %d, io_weight value should in range of [10 - 1000]\n",
+                    tasks_json[i]["requirement"]["io_weight"].GetInt());
+                    return -1;
+                }
+            }
+
+
             tasks.push_back(task);
         }
     }
+
+    if (task_cpu_sum > cpu_total) {
+        fprintf(stderr, 
+                    "sum of task-millicore(%lld) is more than total-millicore(%lld)\n",
+                    (long long int)task_cpu_sum,
+                    (long long int)cpu_total);
+        return -1;
+    }
+
+    if (task_memory_sum + tmpfs_size > memory_total) {
+        fprintf(stderr,
+                    "sum of task-memory and tmpfs (%lld) is more than total-memory(%lld)",
+                    (long long int)(task_memory_sum + tmpfs_size),
+                    (long long int)memory_total);
+        return -1;
+    }
     return 0;
- 
+
 }
 
 int AddJob() { 
@@ -424,13 +569,14 @@ int ListAgent() {
     baidu::galaxy::Galaxy* galaxy = baidu::galaxy::Galaxy::ConnectGalaxy(FLAGS_nexus_servers, master_key);
     while (true) {
         std::vector<baidu::galaxy::NodeDescription> agents;
-        baidu::common::TPrinter tp(11);
-        tp.AddRow(11, "", "addr", "state", "pods", "cpu_used", "cpu_assigned", "cpu_total", "mem_used", "mem_assigned", "mem_total", "labels");
+        baidu::common::TPrinter tp(12, 60);
+        tp.AddRow(12, "", "addr", "build", "state", "pods", "cpu_used", "cpu_assigned", "cpu_total", "mem_used", "mem_assigned", "mem_total", "labels");
         if (galaxy->ListAgents(&agents)) {
             for (uint32_t i = 0; i < agents.size(); i++) {
                 std::vector<std::string> vs;
                 vs.push_back(baidu::common::NumToString(i + 1));
                 vs.push_back(agents[i].addr);
+                vs.push_back(agents[i].build);
                 vs.push_back(agents[i].state);
                 vs.push_back(baidu::common::NumToString(agents[i].task_num));
                 vs.push_back(baidu::common::NumToString(agents[i].cpu_used));
@@ -456,10 +602,61 @@ int ListAgent() {
     }
     return 0;
 }
+int ShowTask() {
+     if (FLAGS_j.empty() && FLAGS_e.empty()) {
+        fprintf(stderr, "-j or -e option is required\n");
+        return -1;
+    }
+    std::string master_key = FLAGS_nexus_root_path + FLAGS_master_path; 
+    baidu::galaxy::Galaxy* galaxy = baidu::galaxy::Galaxy::ConnectGalaxy(FLAGS_nexus_servers, master_key);
+    while (true) {
+        std::vector<baidu::galaxy::TaskInformation> tasks;
+        if (!FLAGS_j.empty()) {
+            bool ok = galaxy->GetTasksByJob(FLAGS_j, &tasks);
+            if (!ok) {
+                fprintf(stderr, "Fail to get tasks\n");
+                return -1;
+            }
+        } else if (!FLAGS_e.empty()) {
+            bool ok = galaxy->GetTasksByAgent(FLAGS_e, &tasks);
+            if (!ok) {
+                fprintf(stderr, "Fail to get tasks\n");
+                return -1;
+            }
+        }
+        baidu::common::TPrinter tp(9, 60);
+        tp.AddRow(9, "", "podid", "state", "cpu", "mem", "disk(r/w)","endpoint", "deploy","start");
+        for (size_t i = 0; i < tasks.size(); i++) {
+            std::vector<std::string> vs;
+            vs.push_back(baidu::common::NumToString((int32_t)i + 1));
+            vs.push_back(tasks[i].podid);
+            vs.push_back(tasks[i].state);
+            std::string cpu = baidu::common::NumToString(tasks[i].used.millicores);
+            vs.push_back(cpu);
+            std::string mem = baidu::common::HumanReadableString(tasks[i].used.memory);
+            vs.push_back(mem);
+            std::string disk_io = baidu::common::HumanReadableString(tasks[i].used.read_bytes_ps) +"/s" + " / " 
+                                  + baidu::common::HumanReadableString(tasks[i].used.write_bytes_ps) +"/s";
+            vs.push_back(disk_io);
+            vs.push_back(tasks[i].endpoint);
+            vs.push_back(FormatDate(tasks[i].deploy_time));
+            vs.push_back(FormatDate(tasks[i].start_time));
+            tp.AddRow(vs);
+        }
+        printf("%s\n", tp.ToString().c_str());
+        if (FLAGS_d <=0) {
+            break;
+        }else{
+            ::sleep(FLAGS_d);
+            ::system("clear");
+        }
+    }
+    return 0;
+}
 
 int ShowPod() {
-    if (FLAGS_j.empty() && FLAGS_n.empty()) {
-        fprintf(stderr, "-j or -n option is required\n");
+    if (FLAGS_j.empty() && FLAGS_n.empty() && FLAGS_e.empty()) {
+        fprintf(stderr, "-j ,-n or -e  option is required\n");
         return -1;
     }
     std::string master_key = FLAGS_nexus_root_path + FLAGS_master_path; 
@@ -478,14 +675,20 @@ int ShowPod() {
                 fprintf(stderr, "Fail to get pods\n");
                 return -1;
             }
+        } else if (!FLAGS_e.empty()) {
+            bool ok = galaxy->GetPodsByAgent(FLAGS_e, &pods);
+            if (!ok) {
+                fprintf(stderr, "Fail to get pods\n");
+                return -1;
+            }
+
         } 
-        baidu::common::TPrinter tp(10);
-        tp.AddRow(10, "", "id", "stage", "state", "cpu(used/assigned)", "mem(used/assigned)","disk(r/w)", "endpoint", "version");
+        baidu::common::TPrinter tp(11, 60);
+        tp.AddRow(11, "", "id", "state", "cpu(u/a)", "mem(u/a)", "disk(r/w)","endpoint", "version", "pending","sched","start");
         for (size_t i = 0; i < pods.size(); i++) {
             std::vector<std::string> vs;
             vs.push_back(baidu::common::NumToString((int32_t)i + 1));
             vs.push_back(pods[i].podid);
-            vs.push_back(pods[i].stage);
             vs.push_back(pods[i].state);
             std::string cpu = baidu::common::NumToString(pods[i].used.millicores) + "/" +\
                               baidu::common::NumToString(pods[i].assigned.millicores);
@@ -498,6 +701,9 @@ int ShowPod() {
             vs.push_back(disk_io);
             vs.push_back(pods[i].endpoint);
             vs.push_back(pods[i].version);
+            vs.push_back(FormatDate(pods[i].pending_time));
+            vs.push_back(FormatDate(pods[i].sched_time));
+            vs.push_back(FormatDate(pods[i].start_time));
             tp.AddRow(vs);
         }
         printf("%s\n", tp.ToString().c_str());
@@ -655,14 +861,14 @@ int GetMasterStatus() {
         fprintf(stderr, "fail to get master addr\n");
         return -1;
     }
-    baidu::common::TPrinter master(2);
+    baidu::common::TPrinter master(2, 60);
     printf("master infomation\n");
     master.AddRow(2, "addr", "state");
     std::string mode = status.safe_mode ? "safe mode" : "normal mode";
     master.AddRow(2, master_endpoint.c_str(), mode.c_str());
     printf("%s\n", master.ToString().c_str());
 
-    baidu::common::TPrinter agent(3);
+    baidu::common::TPrinter agent(3, 60);
     printf("cluster agent infomation\n");
     agent.AddRow(3, "agent total", "live count", "dead count");
     agent.AddRow(3, baidu::common::NumToString(status.agent_total).c_str(), 
@@ -671,7 +877,7 @@ int GetMasterStatus() {
     printf("%s\n", agent.ToString().c_str());
 
 
-    baidu::common::TPrinter mem(3);
+    baidu::common::TPrinter mem(3, 60);
     printf("cluster memory infomation\n");
     mem.AddRow(3, "mem total", "mem used", "mem assigned");
     mem.AddRow(3, baidu::common::HumanReadableString(status.mem_total).c_str(), 
@@ -679,7 +885,7 @@ int GetMasterStatus() {
                      baidu::common::HumanReadableString(status.mem_assigned).c_str());
     printf("%s\n", mem.ToString().c_str());
 
-    baidu::common::TPrinter cpu(3);
+    baidu::common::TPrinter cpu(3, 60);
     printf("cluster cpu infomation\n");
     cpu.AddRow(3, "cpu total", "cpu used", "cpu assigned");
     cpu.AddRow(3, baidu::common::NumToString(status.cpu_total).c_str(), 
@@ -687,7 +893,7 @@ int GetMasterStatus() {
                   baidu::common::NumToString(status.cpu_assigned).c_str());
     printf("%s\n", cpu.ToString().c_str());
 
-    baidu::common::TPrinter job(5);
+    baidu::common::TPrinter job(5, 60);
     printf("cluster job infomation\n");
     job.AddRow(5, "job count", "job scale up", "job scale down", "job need update", "pod count");
     job.AddRow(5, baidu::common::NumToString(status.job_count).c_str(), 
@@ -706,8 +912,8 @@ int ListJob() {
     baidu::galaxy::Galaxy* galaxy = baidu::galaxy::Galaxy::ConnectGalaxy(FLAGS_nexus_servers, master_key);
     while(true) {
         std::vector<baidu::galaxy::JobInformation> infos;
-        baidu::common::TPrinter tp(10);
-        tp.AddRow(10, "", "id", "name", "state", "stat(r/p/d)", "replica", "batch", "cpu", "memory", "disk(r/w)");
+        baidu::common::TPrinter tp(12, 60);
+        tp.AddRow(12, "", "id", "name", "state", "stat(r/p/d/e)", "replica", "batch", "cpu", "memory","disk(r/w)","create", "update");
         if (galaxy->ListJobs(&infos)) {
             for (uint32_t i = 0; i < infos.size(); i++) {
                 std::vector<std::string> vs;
@@ -717,13 +923,16 @@ int ListJob() {
                 vs.push_back(infos[i].state);
                 vs.push_back(baidu::common::NumToString(infos[i].running_num) + "/" + 
                              baidu::common::NumToString(infos[i].pending_num) + "/" +
-                             baidu::common::NumToString(infos[i].deploying_num));
+                             baidu::common::NumToString(infos[i].deploying_num) + "/"+
+                             baidu::common::NumToString(infos[i].death_num));
                 vs.push_back(baidu::common::NumToString(infos[i].replica));
                             vs.push_back(infos[i].is_batch ? "batch" : "");
                 vs.push_back(baidu::common::NumToString(infos[i].cpu_used));
                 vs.push_back(baidu::common::HumanReadableString(infos[i].mem_used));
                 vs.push_back(baidu::common::HumanReadableString(infos[i].read_bytes_ps) + "/s / " + 
                              baidu::common::HumanReadableString(infos[i].write_bytes_ps)+"/s");
+                vs.push_back(FormatDate(infos[i].create_time));
+                vs.push_back(FormatDate(infos[i].update_time));
                 tp.AddRow(vs);
             }
             printf("%s\n", tp.ToString().c_str());
@@ -776,32 +985,32 @@ int KillJob() {
 int OnlineAgent() {
     std::string master_key = FLAGS_nexus_root_path + FLAGS_master_path; 
     baidu::galaxy::Galaxy* galaxy = baidu::galaxy::Galaxy::ConnectGalaxy(FLAGS_nexus_servers, master_key);
-    if (FLAGS_a.empty()) {
-        fprintf(stderr, "-a is required when online agent\n");
+    if (FLAGS_e.empty()) {
+        fprintf(stderr, "-e is required when online agent\n");
         return -1;
     }
-    bool ok = galaxy->OnlineAgent(FLAGS_a);
+    bool ok = galaxy->OnlineAgent(FLAGS_e);
     if (ok) {
-        fprintf(stdout, "online agent %s successfully \n", FLAGS_a.c_str());
+        fprintf(stdout, "online agent %s successfully \n", FLAGS_e.c_str());
         return 0;
     }
-    fprintf(stderr, "fail to online agent %s \n", FLAGS_a.c_str());
+    fprintf(stderr, "fail to online agent %s \n", FLAGS_e.c_str());
     return -1;
 }
 
 int OfflineAgent() {
     std::string master_key = FLAGS_nexus_root_path + FLAGS_master_path; 
     baidu::galaxy::Galaxy* galaxy = baidu::galaxy::Galaxy::ConnectGalaxy(FLAGS_nexus_servers, master_key);
-    if (FLAGS_a.empty()) {
-        fprintf(stderr, "-a is required when offline agent\n");
+    if (FLAGS_e.empty()) {
+        fprintf(stderr, "-e is required when offline agent\n");
         return -1;
     }
-    bool ok = galaxy->OfflineAgent(FLAGS_a);
+    bool ok = galaxy->OfflineAgent(FLAGS_e);
     if (ok) {
-        fprintf(stdout, "offline agent %s successfully \n", FLAGS_a.c_str());
+        fprintf(stdout, "offline agent %s successfully \n", FLAGS_e.c_str());
         return 0;
     }
-    fprintf(stderr, "fail to offline agent %s \n", FLAGS_a.c_str());
+    fprintf(stderr, "fail to offline agent %s \n", FLAGS_e.c_str());
     return -1;
 }
 
@@ -827,6 +1036,8 @@ int main(int argc, char* argv[]) {
         return KillJob();
     } else if (strcmp(argv[1], "pods") ==0){
         return ShowPod();
+    } else if (strcmp(argv[1], "tasks") ==0){
+        return ShowTask();
     } else if (strcmp(argv[1], "status") == 0) {
         return GetMasterStatus();
     } else if (argc > 2 && strcmp(argv[2], "safemode") == 0) {

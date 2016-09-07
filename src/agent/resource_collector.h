@@ -34,6 +34,24 @@ struct ResourceStatistics {
     long cpu_cores;
 
     long memory_rss_in_bytes;
+    long tmpfs_in_bytes;
+        
+    //io
+    long rd_ios;
+    long wr_ios;
+    long rd_sectors;
+    long wr_sectors;
+
+    //interupt
+    long interupt_times;
+    long soft_interupt_times;
+
+    //net
+    long net_in_bits;
+    long net_out_bits;
+    long net_in_packets;
+    long net_out_packets;
+	
     ResourceStatistics() :
         cpu_user_time(0),
         cpu_nice_time(0),
@@ -45,9 +63,21 @@ struct ResourceStatistics {
         cpu_stealstolen(0),
         cpu_guest(0),
         cpu_cores(0),
-        memory_rss_in_bytes(0) {
-    }
+        memory_rss_in_bytes(0),
+        tmpfs_in_bytes(0),
+        rd_ios(0),
+        wr_ios(0),
+        rd_sectors(0),
+        wr_sectors(0),
+        interupt_times(0),
+        soft_interupt_times(0),
+        net_in_bits(0),
+        net_out_bits(0),
+        net_in_packets(0),
+        net_out_packets(0) {
+	}
 };
+
 
 // unit jiffies
 struct CgroupResourceStatistics {
@@ -66,6 +96,95 @@ struct CgroupResourceStatistics {
     }
 };
 
+struct SysStat {
+    ResourceStatistics last_stat_;
+    ResourceStatistics cur_stat_;
+    double cpu_used_;
+    double mem_used_;
+    double disk_read_Bps_;
+    double disk_write_Bps_;
+    double disk_read_times_;
+    double disk_write_times_;
+    double disk_io_util_;
+    double net_in_bps_;
+    double net_out_bps_;
+    double net_in_pps_;
+    double net_out_pps_;
+    double intr_rate_;
+    double soft_intr_rate_;
+    int cpu_used_ex_;
+    int mem_used_ex_;
+    int disk_read_Bps_ex_;
+    int disk_write_Bps_ex_;
+    int disk_read_times_ex_;
+    int disk_write_times_ex_;
+    int disk_io_util_ex_;
+    int net_in_bps_ex_;
+    int net_out_bps_ex_;
+    int net_in_pps_ex_;
+    int net_out_pps_ex_;
+    int intr_rate_ex_;
+    int soft_intr_rate_ex_;
+    bool cpu_used_busy_;
+    bool mem_used_busy_;
+    bool disk_read_Bps_busy_;
+    bool disk_write_Bps_busy_;
+    bool disk_read_times_busy_;
+    bool disk_write_times_busy_;
+    bool disk_io_util_busy_;
+    bool net_in_bps_busy_;
+    bool net_out_bps_busy_;
+    bool net_in_pps_busy_;
+    bool net_out_pps_busy_;
+    bool intr_rate_busy_;
+    bool soft_intr_rate_busy_;
+    int collect_times_;
+    SysStat():last_stat_(),
+              cur_stat_(),
+              cpu_used_(0.0),
+              mem_used_(0.0),
+              disk_read_Bps_(0.0),
+              disk_write_Bps_(0.0),
+              disk_read_times_(0.0),
+              disk_write_times_(0.0),
+              disk_io_util_(0.0),
+              net_in_bps_(0.0),
+              net_out_bps_(0.0),
+              net_in_pps_(0.0),
+              net_out_pps_(0.0),
+              intr_rate_(0.0),
+              soft_intr_rate_(0.0),
+              cpu_used_ex_(0),
+              mem_used_ex_(0),
+              disk_read_Bps_ex_(0),
+              disk_write_Bps_ex_(0),
+              disk_read_times_ex_(0),
+              disk_write_times_ex_(0),
+              disk_io_util_ex_(0),
+              net_in_bps_ex_(0),
+              net_out_bps_ex_(0),
+              net_in_pps_ex_(0),
+              net_out_pps_ex_(0),
+              intr_rate_ex_(0),
+              soft_intr_rate_ex_(0),
+              cpu_used_busy_(false),
+              mem_used_busy_(false),
+              disk_read_Bps_busy_(false),
+              disk_write_Bps_busy_(false),
+              disk_read_times_busy_(false),
+              disk_write_times_busy_(false),
+              disk_io_util_busy_(false),
+              net_in_bps_busy_(false),
+              net_out_bps_busy_(false),
+              net_in_pps_busy_(false),
+              net_out_pps_busy_(false),
+              intr_rate_busy_(false),
+              soft_intr_rate_busy_(false),
+              collect_times_(0) {
+        }
+    ~SysStat(){
+        }
+};
 //
 struct ProcIOStatistics {
     int64_t rchar;
@@ -77,8 +196,17 @@ struct ProcIOStatistics {
     int64_t cancelled_write_bytes;
 };
 
+struct BlkioStatistics {
+    int64_t read;
+    int64_t write;
+    int64_t sync;
+    int64_t async;
+    int64_t total;
+};
+
 struct CGroupIOStatistics{
     std::map<int, ProcIOStatistics> processes;
+    BlkioStatistics blkio;
 };
 
 class CGroupIOCollector{
@@ -86,10 +214,13 @@ class CGroupIOCollector{
 public:
     CGroupIOCollector();
     ~CGroupIOCollector();
-    static bool Collect(const std::string& cgroup_path,
+    static bool Collect(const std::string& freezer_path,
+                        const std::string& blkio_path,
                         CGroupIOStatistics* stat);
 private:
     static bool GetProcIOStat(int pid, ProcIOStatistics* stat);
+    static bool GetBlkioStat(const std::string& group_path,
+                             BlkioStatistics* blkio);
 };
 
 class CGroupResourceCollector : public ResourceCollector {
@@ -142,9 +273,28 @@ private:
     int collector_times_;
 };
 
-
-
-
+class GlobalResourceCollector {
+public:
+    explicit GlobalResourceCollector();
+    virtual ~GlobalResourceCollector();
+    int CollectStatistics();
+    SysStat* GetStat(); 
+private:
+    bool GetGlobalCpuStat();
+    bool GetGlobalMemStat();
+    bool GetGlobalIntrStat();
+    bool GetGlobalNetStat();
+    bool GetGlobalIOStat();
+    bool CheckSysHealth();
+    bool IsItemBusy(const double value,
+                    const double threshold,
+                    int& ex_time,
+                    const int max_ex_time,
+                    bool& busy,
+                    const std::string title);
+private:
+    SysStat* stat_;
+};
 }   // ending namespace galaxy
 }   // ending namespace baidu
 

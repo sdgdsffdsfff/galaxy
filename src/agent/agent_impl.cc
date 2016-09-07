@@ -5,7 +5,6 @@
 #include "agent/agent_impl.h"
 
 #include "gflags/gflags.h"
-
 #include "boost/bind.hpp"
 #include "boost/algorithm/string.hpp"
 #include "boost/algorithm/string/split.hpp"
@@ -20,6 +19,7 @@ DECLARE_string(master_port);
 DECLARE_int32(agent_background_threads_num);
 DECLARE_int32(agent_heartbeat_interval);
 DECLARE_int32(agent_trace_pod_interval);
+DECLARE_string(agent_build);
 DECLARE_string(agent_ip);
 DECLARE_string(agent_port);
 DECLARE_string(agent_work_dir);
@@ -28,10 +28,13 @@ DECLARE_int32(agent_millicores_share);
 DECLARE_int64(agent_mem_share);
 
 DECLARE_string(agent_persistence_path);
+DECLARE_bool(enable_resource_minitor);
+DECLARE_int32(stat_check_period);
+DECLARE_int32(agent_recover_threshold);
 
 namespace baidu {
 namespace galaxy {
-
+    
 AgentImpl::AgentImpl() : 
     master_endpoint_(),
     lock_(),
@@ -42,13 +45,15 @@ AgentImpl::AgentImpl() :
     master_(NULL),
     resource_capacity_(),
     master_watcher_(NULL),
-    mutex_master_endpoint_() { 
-
+    mutex_master_endpoint_(),
+    state_(kInit),
+    build_(FLAGS_agent_build) {
     rpc_client_ = new RpcClient();    
     endpoint_ = FLAGS_agent_ip;
     endpoint_.append(":");
     endpoint_.append(FLAGS_agent_port);
     master_watcher_ = new MasterWatcher();
+    recover_threshold_ = 0;
 }
 
 AgentImpl::~AgentImpl() {
@@ -69,6 +74,7 @@ void AgentImpl::Query(::google::protobuf::RpcController* /*cntl*/,
     resp->set_status(kOk);
     AgentInfo agent_info; 
     agent_info.set_endpoint(endpoint_);
+    agent_info.set_build(build_);
     agent_info.mutable_total()->set_millicores(
             FLAGS_agent_millicores_share);
     agent_info.mutable_total()->set_memory(
@@ -133,6 +139,9 @@ void AgentImpl::CreatePodInfo(
         task_info.stage = kTaskStagePENDING;
         task_info.fail_retry_times = 0;
         task_info.max_retry_times = 10;
+        if (req->has_job_name()) {
+            task_info.job_name = req->job_name();
+        }
         pod_info->tasks[task_info.task_id] = task_info;
     }
     if (req->has_job_name()) {
@@ -146,6 +155,22 @@ void AgentImpl::RunPod(::google::protobuf::RpcController* /*cntl*/,
                        ::google::protobuf::Closure* done) {
     do {
         MutexLock scope_lock(&lock_);
+        if (state_ == kOffline) {
+            resp->set_status(kAgentError);
+            lock_.Unlock();
+            OfflineAgentRequest request;
+            OfflineAgentResponse response;
+            MutexLock lock(&mutex_master_endpoint_);
+            request.set_endpoint(endpoint_);
+            if (!rpc_client_->SendRequest(master_,
+                                          &Master_Stub::OfflineAgent,
+                                          &request,
+                                          &response,
+                                          5, 1)) {
+                LOG(WARNING, "send offline request fail");
+            }
+            break;
+        }
         if (!req->has_podid()
                 || !req->has_pod()) {
             resp->set_status(kInputError);  
@@ -217,14 +242,37 @@ void AgentImpl::KillPod(::google::protobuf::RpcController* /*cntl*/,
     return;
 }
 
+void AgentImpl::KillPodbyType() {
+    MutexLock scope_lock(&lock_);
+    for (std::map<std::string, PodDescriptor>::iterator it = pods_descs_.begin();
+            it != pods_descs_.end(); it++) {
+        std::string pod_id = it->first;
+        PodDescriptor pod_desc = it->second;
+        if (pod_desc.has_type() && pod_desc.type() == kBatch) {
+            pod_manager_.DeletePod(pod_id);
+            LOG(WARNING, "force to kill %s", pod_id.c_str());
+            return;
+        }
+    }
+    for (std::map<std::string, PodDescriptor>::iterator it = pods_descs_.begin();
+            it != pods_descs_.end(); it++) {
+        std::string pod_id = it->first;
+        PodDescriptor pod_desc = it->second;
+        if (pod_desc.has_type() && pod_desc.type() == kLongRun) {
+            pod_manager_.DeletePod(pod_id);
+            LOG(WARNING, "force to kill %s", pod_id.c_str());
+            return;
+        }
+    }
+}
+
 void AgentImpl::KeepHeartBeat() {
     MutexLock lock(&mutex_master_endpoint_);
     if (!PingMaster()) {
-        LOG(WARNING, "ping master %s failed", 
-                     master_endpoint_.c_str());
+        LOG(WARNING, "ping master %s failed",master_endpoint_.c_str());
     }
     background_threads_.DelayTask(FLAGS_agent_heartbeat_interval,
-                                  boost::bind(&AgentImpl::KeepHeartBeat, this));
+            boost::bind(&AgentImpl::KeepHeartBeat, this));
     return;
 }
 
@@ -294,7 +342,9 @@ bool AgentImpl::Init() {
     background_threads_.DelayTask(
                 500, 
                 boost::bind(&AgentImpl::LoopCheckPods, this)); 
-
+    if (FLAGS_enable_resource_minitor) {
+        background_threads_.AddTask(boost::bind(&AgentImpl::CheckSysHealth, this));
+    }
     return true;
 }
 
@@ -302,7 +352,7 @@ bool AgentImpl::PingMaster() {
     mutex_master_endpoint_.AssertHeld();
     HeartBeatRequest request;
     HeartBeatResponse response;
-    request.set_endpoint(endpoint_); 
+    request.set_endpoint(endpoint_);
     return rpc_client_->SendRequest(master_,
                                     &Master_Stub::HeartBeat,
                                     &request,
@@ -475,6 +525,59 @@ void AgentImpl::ShowPods(::google::protobuf::RpcController* /*cntl*/,
         LOG(INFO, "pods show size %d", resp->pods_size());
     } while (0);
     done->Run();    
+    return;
+}
+
+void AgentImpl::CheckSysHealth() {
+    int coll_rlt = resource_collector_.CollectStatistics();
+    if (coll_rlt == 1) {
+        LOG(WARNING, "CollectStatistics fail");
+    } else if (coll_rlt == 2) {
+        LOG(INFO, "CollectStatistics not ready");
+    } else if (coll_rlt == 0) {
+        LOG(INFO, "CollectStatistics healthy");
+        recover_threshold_++;
+        if ((recover_threshold_ > FLAGS_agent_recover_threshold 
+                && state_ == kOffline) || state_ == kInit) {
+            OnlineAgentRequest request;
+            OnlineAgentResponse response;
+            MutexLock lock(&mutex_master_endpoint_);
+            request.set_endpoint(endpoint_);
+            if (!rpc_client_->SendRequest(master_,
+                                          &Master_Stub::OnlineAgent,
+                                          &request,
+                                          &response,
+                                          5, 1)) {
+                LOG(WARNING, "send online request fail");
+            } else {
+                mutex_master_endpoint_.Unlock();
+                MutexLock scope_lock(&lock_);
+                state_ = kAlive;
+                LOG(WARNING, "agent state Alive.");
+            }
+        }
+    } else if (coll_rlt == 3) {
+        recover_threshold_ = 0;
+        KillPodbyType();
+        if (state_ != kOffline) {
+            MutexLock scope_lock(&lock_);
+            state_ = kOffline;
+            LOG(WARNING, "agent state offline, sys health checker kill all pods");
+            lock_.Unlock();
+            OfflineAgentRequest request;
+            OfflineAgentResponse response;
+            MutexLock lock(&mutex_master_endpoint_);
+            request.set_endpoint(endpoint_);
+            if (!rpc_client_->SendRequest(master_,
+                                         &Master_Stub::OfflineAgent,
+                                         &request,
+                                         &response,
+                                         5, 1)) {
+                LOG(WARNING, "send offline request fail");
+            }
+        }
+    }
+    background_threads_.DelayTask(FLAGS_stat_check_period, boost::bind(&AgentImpl::CheckSysHealth, this));
     return;
 }
 
